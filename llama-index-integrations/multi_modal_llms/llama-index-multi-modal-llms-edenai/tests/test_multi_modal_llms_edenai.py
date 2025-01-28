@@ -3,7 +3,12 @@ from llama_index.multi_modal_llms.edenai import EdenaiMultiModal
 import pytest
 from unittest.mock import patch, MagicMock
 from llama_index.core.schema import ImageDocument
-
+from llama_index.core.llms import (
+    ChatMessage,
+    ImageBlock,
+    TextBlock,
+    MessageRole,
+)
 
 def test_class_name():
     """Test class name."""
@@ -52,4 +57,45 @@ def test_complete(mock_post):
     assert "prompt_tokens" in response.additional_kwargs
     assert "completion_tokens" in response.additional_kwargs
     assert "total_tokens" in response.additional_kwargs
+    mock_post.assert_called_once()
+
+
+def mock_chat_response():
+    return {
+        "openai/gpt-4o": {
+            "generated_text": "This is an image of a cat.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "content": {"text": "What is shown in this image?"}}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "content": {"text": "This is an image of a cat."}}]
+                }
+            ],
+            "status": "success",
+        }
+    }
+
+@patch("httpx.post")
+def test_chat(mock_post):
+    mock_post.return_value = MagicMock(status_code=200, json=mock_chat_response)
+    
+    llm = EdenaiMultiModal(model_name="openai/gpt-4o", api_key="fake-api-key")
+    image_doc = ImageDocument(image_url="https://example.com/cat.jpg")
+    
+    messages = [
+        ChatMessage(
+            role=MessageRole.USER,
+            blocks=[
+                TextBlock(text="What is shown in this image?"),
+                ImageBlock(image=None, path=None, url=image_doc.image_url)
+            ]
+        )
+    ]
+    
+    response = llm.chat(messages=messages)
+    print(response.message.content)    
+    assert response.message.content == "This is an image of a cat."
     mock_post.assert_called_once()
