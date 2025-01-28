@@ -51,7 +51,7 @@ def edenai_response_to_chat_response(
         role = "assistant"  
         content = response[model_name]["generated_text"] or ""
         return ChatResponse(
-            message=ChatMessage(role=role, content=content), raw=response
+            message=ChatMessage(role=role, content=content, raw=response),
         )
     except: 
         return ChatResponse(message=ChatMessage(), raw=response)
