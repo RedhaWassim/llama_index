@@ -1,16 +1,10 @@
 """EdenAI LLM API Integration."""
-
-from http import HTTPStatus
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from llama_index.core.base.llms.types import (
     ChatMessage,
     ChatResponse,
-    ChatResponseAsyncGen,
-    ChatResponseGen,
     CompletionResponse,
-    CompletionResponseAsyncGen,
-    CompletionResponseGen,
     LLMMetadata,
     MessageRole,
 )
@@ -24,12 +18,11 @@ from llama_index.core.bridge.pydantic import Field
 from llama_index.core.callbacks import CallbackManager
 from llama_index.core.multi_modal_llms import (
     MultiModalLLM,
-    MultiModalLLMMetadata,
+    MultiModalLLMMetadata
 )
 
 from llama_index.core.schema import ImageNode
 from llama_index.multi_modal_llms.edenai.utils import (
-    chat_message_to_edenai_multi_modal_messages,
     edenai_response_to_chat_response,
     edenai_response_to_completion_response,
 )
@@ -37,47 +30,12 @@ from llama_index.multi_modal_llms.edenai.utils import (
 import httpx
 
 
-class EdenaiMultiModalModels:
-    """EdenAI Models."""
-
-    GPT_4 = "edenai/openai/gpt-4"
-    GEMINI_FLASH = "edenai/google/gemini-1.5-flash"
-    GEMINI_PRO = "edenai/google/gemini-1.5-pro"
-
-
-EDENAI_MODEL_META = {
-   EdenaiMultiModalModels.GPT_4: {
-        "context_window": 32768,
-        "num_output": 1500,
-        "is_chat_model": True,
-    },
-   EdenaiMultiModalModels.GEMINI_FLASH: {
-        "context_window": 8192,
-        "num_output": 8192,
-        "is_chat_model": True,
-    },
-   EdenaiMultiModalModels.GEMINI_PRO: {
-        "context_window": 8192,
-        "num_output": 8192,
-        "is_chat_model": True,
-    },
-}
-
 
 class EdenaiMultiModal(MultiModalLLM):
     """EdenAI LLM."""
 
     model_name: str = Field(
-        default=EdenaiMultiModalModels.GPT_4,
-        description="The EdenAI model to use.",
-    )
-from typing import Optional
-
-class EdenaiMultiModal(MultiModalLLM):
-    """EdenAI LLM."""
-
-    model_name: str = Field(
-        default=EdenaiMultiModalModels.GPT_4,
+        default="openai/gpt-4o",
         description="The EdenAI model to use.",
     )
     temperature: Optional[float] = Field(
@@ -101,7 +59,7 @@ class EdenaiMultiModal(MultiModalLLM):
 
     def __init__(
         self,
-        model_name: Optional[str] = EdenaiMultiModalModels.GPT_4,
+        model_name: Optional[str] = "openai/gpt-4o",
         temperature: Optional[float] = 0.7,
         max_tokens: Optional[int] = 1000,
         api_key: Optional[str] = None,
@@ -122,9 +80,9 @@ class EdenaiMultiModal(MultiModalLLM):
         return "edenai_multi_modal_llm"
 
     @property
-    def metadata(self) -> LLMMetadata:
-        return LLMMetadata(
-            model_name=self.model_name, **EDENAI_MODEL_META[self.model_name]
+    def metadata(self) -> MultiModalLLMMetadata:
+        return MultiModalLLMMetadata(
+            model_name=self.model_name, num_output=self.max_tokens
         )
 
     def _get_default_parameters(self) -> Dict:
@@ -179,6 +137,7 @@ class EdenaiMultiModal(MultiModalLLM):
         try:
             response = httpx.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
+            print(response)
             return response.json() 
         except httpx.HTTPStatusError as e:
             raise ValueError(

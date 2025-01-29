@@ -1,6 +1,5 @@
 """EdenAI API Utils."""
 
-from http import HTTPStatus
 from typing import Any, Dict, List, Sequence
 
 from llama_index.core.base.llms.types import (
@@ -8,7 +7,6 @@ from llama_index.core.base.llms.types import (
     ChatResponse,
     CompletionResponse,
 )
-from llama_index.core.schema import ImageDocument
 
 
 def get_usage_from_response(response: Dict) -> Dict:
@@ -67,44 +65,3 @@ def chat_message_to_edenai_multi_modal_messages(
     for msg in chat_messages:
         messages.append({"role": msg.role.value, "content": msg.content})
     return messages
-
-
-def create_edenai_multi_modal_chat_message(
-    prompt: str, role: str, image_documents: Sequence[ImageDocument]
-) -> ChatMessage:
-    """
-    Create a ChatMessage object for multimodal requests, including text and images.
-    """
-    if not image_documents:
-        message = ChatMessage(role=role, content=[{"type": "text", "content": {"text": prompt}}])
-    else:
-        content = []
-        for image_document in image_documents:
-            content.append(
-                {
-                    "type": "media_url",
-                    "content": {
-                        "media_url": (
-                            image_document.image_url
-                            if image_document.image_url is not None
-                            else image_document.image_path
-                        ),
-                        "media_type": "image/jpeg",
-                    },
-                }
-            )
-        content.append({"type": "text", "content": {"text": prompt}})
-        message = ChatMessage(role=role, content=content)
-
-    return message
-
-
-def load_local_images(local_images: List[str]) -> List[ImageDocument]:
-    """
-    Load images from local paths into ImageDocument objects.
-    """
-    image_documents = []
-    for _, img in enumerate(local_images):
-        new_image_document = ImageDocument(image_path=img)
-        image_documents.append(new_image_document)
-    return image_documents

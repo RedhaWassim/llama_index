@@ -1,6 +1,5 @@
 from llama_index.core.multi_modal_llms.base import MultiModalLLM
 from llama_index.multi_modal_llms.edenai import EdenaiMultiModal
-import pytest
 from unittest.mock import patch, MagicMock
 from llama_index.core.schema import ImageDocument
 from llama_index.core.llms import (
