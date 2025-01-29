@@ -1,4 +1,5 @@
 """EdenAI LLM API Integration."""
+
 from typing import Any, Dict, List, Optional, Sequence
 
 from llama_index.core.base.llms.types import (
@@ -16,10 +17,7 @@ from llama_index.core.llms import (
 )
 from llama_index.core.bridge.pydantic import Field
 from llama_index.core.callbacks import CallbackManager
-from llama_index.core.multi_modal_llms import (
-    MultiModalLLM,
-    MultiModalLLMMetadata
-)
+from llama_index.core.multi_modal_llms import MultiModalLLM, MultiModalLLMMetadata
 
 from llama_index.core.schema import ImageNode
 from llama_index.multi_modal_llms.edenai.utils import (
@@ -30,7 +28,6 @@ from llama_index.multi_modal_llms.edenai.utils import (
 import httpx
 
 
-
 class EdenaiMultiModal(MultiModalLLM):
     """EdenAI LLM."""
 
@@ -38,9 +35,7 @@ class EdenaiMultiModal(MultiModalLLM):
         default="openai/gpt-4o",
         description="The EdenAI model to use.",
     )
-    temperature: Optional[float] = Field(
-        default=0, description="Sampling temperature."
-    )
+    temperature: Optional[float] = Field(default=0, description="Sampling temperature.")
     max_tokens: Optional[int] = Field(
         default=1000, description="Maximum tokens for generation."
     )
@@ -50,12 +45,10 @@ class EdenaiMultiModal(MultiModalLLM):
     top_p: Optional[float] = Field(
         default=None, description="Top-p sampling parameter."
     )
-    top_k: Optional[int] = Field(
-        default=None, description="Top-k sampling parameter."
-    )
+    top_k: Optional[int] = Field(default=None, description="Top-k sampling parameter.")
     chat_global_action: Optional[str] = Field(
         default=None, description="Global action for chat models."
-    ) 
+    )
 
     def __init__(
         self,
@@ -98,7 +91,6 @@ class EdenaiMultiModal(MultiModalLLM):
             if value is not None
         }
 
-
     def _call_edenai_api(
         self,
         model: str,
@@ -126,7 +118,7 @@ class EdenaiMultiModal(MultiModalLLM):
         payload = {
             "messages": messages,
             "show_original_response": True,
-            "providers": [self.model_name]
+            "providers": [self.model_name],
         }
 
         if parameters:
@@ -138,15 +130,17 @@ class EdenaiMultiModal(MultiModalLLM):
             response = httpx.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
             print(response)
-            return response.json() 
+            return response.json()
         except httpx.HTTPStatusError as e:
             raise ValueError(
                 f"EdenAI API request failed with status code {e.response.status_code}: {e.response.text}"
             )
         except Exception as e:
             raise ValueError(f"An error occurred while calling EdenAI API: {e}")
-    
-    def _format_message(self, prompt: str, image_documents: Sequence[ImageNode], role: MessageRole) -> Dict:
+
+    def _format_message(
+        self, prompt: str, image_documents: Sequence[ImageNode], role: MessageRole
+    ) -> Dict:
         """
         Formats a message for the EdenAI API.
 
@@ -162,14 +156,29 @@ class EdenaiMultiModal(MultiModalLLM):
         if image_documents:
             for image_document in image_documents:
                 if image_document.image_url:
-                    content.append({"type": "media_url", "content": {"media_url": image_document.image_url,"media_type":"image/jpeg"}})
+                    content.append(
+                        {
+                            "type": "media_url",
+                            "content": {
+                                "media_url": image_document.image_url,
+                                "media_type": "image/jpeg",
+                            },
+                        }
+                    )
                 else:
-                    content.append({"type": "media_base64", "content": {"media_base64": image_document.image}})
+                    content.append(
+                        {
+                            "type": "media_base64",
+                            "content": {"media_base64": image_document.image},
+                        }
+                    )
 
         content.append({"type": "text", "content": {"text": prompt}})
-        return [{"role": role.value, "content": content}]  
+        return [{"role": role.value, "content": content}]
 
-    def complete(self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any) -> CompletionResponse:
+    def complete(
+        self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any
+    ) -> CompletionResponse:
         """
         Sends a completion request to the EdenAI API.
 
@@ -183,17 +192,17 @@ class EdenaiMultiModal(MultiModalLLM):
         parameters = self._get_default_parameters()
         parameters.update(kwargs)
 
-        content = self._format_message(prompt, image_documents, MessageRole.USER) 
+        content = self._format_message(prompt, image_documents, MessageRole.USER)
 
         response = self._call_edenai_api(
-            model=self.model_name,
-            messages=content,
-            parameters=parameters,
-            **kwargs
+            model=self.model_name, messages=content, parameters=parameters, **kwargs
         )
 
         return edenai_response_to_completion_response(response, self.model_name)
-    def _process_messages(self, messages: Sequence[ChatMessage]) -> List[Dict[str, Any]]:
+
+    def _process_messages(
+        self, messages: Sequence[ChatMessage]
+    ) -> List[Dict[str, Any]]:
         """
         Processes a list of `ChatMessage` instances into the format required by EdenAI API.
 
@@ -206,49 +215,56 @@ class EdenaiMultiModal(MultiModalLLM):
         formatted_messages = []
 
         for message in messages:
-            formatted_message = {
-                "role": message.role.value,
-                "content": []
-            }
+            formatted_message = {"role": message.role.value, "content": []}
 
             for block in message.blocks:
                 if isinstance(block, TextBlock):
-                    formatted_message["content"].append({
-                        "type": "text",
-                        "content": {"text": block.text}
-                    })
+                    formatted_message["content"].append(
+                        {"type": "text", "content": {"text": block.text}}
+                    )
                 elif isinstance(block, ImageBlock):
                     if block.image:
-                        formatted_message["content"].append({
-                            "type": "media_base64",
-                            "content": {
-                                "media_base64": str(block.image),
-                                "media_type": block.image_mimetype or "image/jpeg"
+                        formatted_message["content"].append(
+                            {
+                                "type": "media_base64",
+                                "content": {
+                                    "media_base64": str(block.image),
+                                    "media_type": block.image_mimetype or "image/jpeg",
+                                },
                             }
-                        })
+                        )
                     elif block.path:
                         try:
                             with open(block.path, "rb") as f:
                                 image_data = f.read()
-                            formatted_message["content"].append({
-                                "type": "media_base64",
-                                "content": {
-                                    "media_base64": str(image_data),
-                                    "media_type": block.image_mimetype or "image/jpeg"
+                            formatted_message["content"].append(
+                                {
+                                    "type": "media_base64",
+                                    "content": {
+                                        "media_base64": str(image_data),
+                                        "media_type": block.image_mimetype
+                                        or "image/jpeg",
+                                    },
                                 }
-                            })
+                            )
                         except FileNotFoundError as e:
-                            raise ValueError(f"Image file not found at path: {block.path}") from e
+                            raise ValueError(
+                                f"Image file not found at path: {block.path}"
+                            ) from e
                     elif block.url:
-                        formatted_message["content"].append({
-                            "type": "media_url",
-                            "content": {
-                                "media_url": str(block.url),
-                                "media_type": block.image_mimetype or "image/jpeg"
+                        formatted_message["content"].append(
+                            {
+                                "type": "media_url",
+                                "content": {
+                                    "media_url": str(block.url),
+                                    "media_type": block.image_mimetype or "image/jpeg",
+                                },
                             }
-                        })
+                        )
                     else:
-                        raise ValueError("ImageBlock must have either 'image', 'path', or 'url' defined.")
+                        raise ValueError(
+                            "ImageBlock must have either 'image', 'path', or 'url' defined."
+                        )
 
             formatted_messages.append(formatted_message)
 
@@ -267,7 +283,6 @@ class EdenaiMultiModal(MultiModalLLM):
         )
 
         return edenai_response_to_chat_response(response, self.model_name)
-
 
     async def acomplete(
         self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any
@@ -307,16 +322,19 @@ class EdenaiMultiModal(MultiModalLLM):
             try:
                 response = await client.post(api_url, headers=headers, json=payload)
                 response.raise_for_status()
-                return edenai_response_to_completion_response(response.json(), self.model_name)
+                return edenai_response_to_completion_response(
+                    response.json(), self.model_name
+                )
             except httpx.HTTPStatusError as e:
                 raise ValueError(
                     f"EdenAI API request failed with status code {e.response.status_code}: {e.response.text}"
                 )
             except Exception as e:
                 raise ValueError(f"An error occurred while calling EdenAI API: {e}")
-            
 
-    async def achat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
+    async def achat(
+        self, messages: Sequence[ChatMessage], **kwargs: Any
+    ) -> ChatResponse:
         """
         Asynchronously sends a chat request to the EdenAI API.
 
@@ -345,14 +363,16 @@ class EdenaiMultiModal(MultiModalLLM):
                     },
                 )
                 response.raise_for_status()
-                return edenai_response_to_chat_response(response.json(), self.model_name)
+                return edenai_response_to_chat_response(
+                    response.json(), self.model_name
+                )
             except httpx.HTTPStatusError as e:
                 raise ValueError(
                     f"EdenAI API request failed with status code {e.response.status_code}: {e.response.text}"
                 )
             except Exception as e:
                 raise ValueError(f"An error occurred while calling EdenAI API: {e}")
-            
+
     def stream_chat(self, messages: Sequence[Any], **kwargs: Any) -> Any:
         """Stream chat with the model."""
         raise NotImplementedError("Stream chat is not supported for this model.")
