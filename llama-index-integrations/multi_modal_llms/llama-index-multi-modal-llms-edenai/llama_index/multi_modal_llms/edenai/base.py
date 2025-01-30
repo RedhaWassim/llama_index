@@ -52,8 +52,8 @@ class EdenaiMultiModal(MultiModalLLM):
 
     def __init__(
         self,
-        model_name: Optional[str] = "openai/gpt-4o",
-        temperature: Optional[float] = 0.7,
+        model_name: str = "openai/gpt-4o",
+        temperature: Optional[float] = 0,
         max_tokens: Optional[int] = 1000,
         api_key: Optional[str] = None,
         callback_manager: Optional[CallbackManager] = None,
@@ -129,7 +129,6 @@ class EdenaiMultiModal(MultiModalLLM):
         try:
             response = httpx.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
-            print(response)
             return response.json()
         except httpx.HTTPStatusError as e:
             raise ValueError(
