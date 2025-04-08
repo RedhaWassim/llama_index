@@ -1,72 +1,20 @@
-"""EdenAI API Utils."""
-
-from typing import Any, Dict, List, Sequence
-
-from llama_index.core.base.llms.types import (
-    ChatMessage,
-    ChatResponse,
-    CompletionResponse,
-)
+from typing import Optional, Dict, Tuple
+import json
 
 
-def get_usage_from_response(response: Dict) -> Dict:
-    """
-    Extract usage data from EdenAI response.
-    If no usage data is available, returns default values.
-    """
-    original_response = response.get("original_response", {})
-    usage_data = original_response.get("usage", {})
+def parse_edenai_stream_chunk(chunk_str: str) -> Tuple[Optional[str], Optional[Dict]]:
+    if not chunk_str.strip():
+        return None, None
 
-    return {
-        "prompt_tokens": usage_data.get("prompt_tokens", 0),
-        "completion_tokens": usage_data.get("completion_tokens", 0),
-        "total_tokens": usage_data.get("total_tokens", 0),
-    }
-
-
-def edenai_response_to_completion_response(
-    response: Any, model_name: str
-) -> CompletionResponse:
-    """
-    Convert EdenAI response to CompletionResponse.
-    """
     try:
-        provider_response = response.get(model_name, {})
-        content = provider_response.get("generated_text", "")
-
-        usage_data = get_usage_from_response(provider_response)
-
-        return CompletionResponse(
-            text=content, raw=response, additional_kwargs=usage_data
-        )
-    except Exception:
-        return CompletionResponse(text="", raw=response)
-
-
-def edenai_response_to_chat_response(
-    response: Any,
-    model_name: str,
-) -> ChatResponse:
-    """
-    Convert EdenAI response to ChatResponse.
-    """
-    try:
-        role = "assistant"
-        content = response[model_name]["generated_text"] or ""
-        return ChatResponse(
-            message=ChatMessage(role=role, content=content, raw=response),
-        )
-    except:
-        return ChatResponse(message=ChatMessage(), raw=response)
-
-
-def chat_message_to_edenai_multi_modal_messages(
-    chat_messages: Sequence[ChatMessage],
-) -> List[Dict]:
-    """
-    Convert ChatMessage objects to EdenAI multimodal message format.
-    """
-    messages = []
-    for msg in chat_messages:
-        messages.append({"role": msg.role.value, "content": msg.content})
-    return messages
+        chunk_json = json.loads(chunk_str)
+        if "choices" in chunk_json and chunk_json["choices"]:
+            choice = chunk_json["choices"][0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content is not None:
+                return content, chunk_json
+        return None, chunk_json
+    except Exception as e:
+        print(f"Error parsing chunk: {e}")
+        return None, {"error": str(e)}

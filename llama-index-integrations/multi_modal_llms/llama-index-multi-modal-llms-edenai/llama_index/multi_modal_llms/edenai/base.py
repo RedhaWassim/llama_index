@@ -1,39 +1,29 @@
-"""EdenAI LLM API Integration."""
-
-from typing import Any, Dict, List, Optional, Sequence
-
+import base64
+import json
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from llama_index.core.base.llms.types import (
     ChatMessage,
     ChatResponse,
     CompletionResponse,
-    LLMMetadata,
     MessageRole,
+    ChatResponseGen,
+    CompletionResponseGen,
 )
-from llama_index.core.llms import (
-    ChatMessage,
-    ImageBlock,
-    TextBlock,
-    MessageRole,
-)
-from llama_index.core.bridge.pydantic import Field
+from llama_index.core.bridge.pydantic import Field, PrivateAttr
 from llama_index.core.callbacks import CallbackManager
-from llama_index.core.multi_modal_llms import MultiModalLLM, MultiModalLLMMetadata
-
-from llama_index.core.schema import ImageNode
-from llama_index.multi_modal_llms.edenai.utils import (
-    edenai_response_to_chat_response,
-    edenai_response_to_completion_response,
-)
-
+from llama_index.core.multi_modal_llms.base import MultiModalLLM, MultiModalLLMMetadata
+from llama_index.core.schema import ImageDocument
+from llama_index.multi_modal_llms.edenai.utils import parse_edenai_stream_chunk
 import httpx
 
 
 class EdenaiMultiModal(MultiModalLLM):
-    """EdenAI LLM."""
+    """EdenAI Multi-Modal LLM Connector."""
 
     model_name: str = Field(
         default="openai/gpt-4o",
-        description="The EdenAI model to use.",
+        description="The EdenAI model to use (e.g. 'openai/gpt-4o').",
+        alias="model",
     )
     temperature: Optional[float] = Field(default=0, description="Sampling temperature.")
     max_tokens: Optional[int] = Field(
@@ -42,31 +32,71 @@ class EdenaiMultiModal(MultiModalLLM):
     api_key: Optional[str] = Field(
         default=None, description="The EdenAI API key.", exclude=True
     )
-    top_p: Optional[float] = Field(
-        default=None, description="Top-p sampling parameter."
+    additional_kwargs: Dict[str, Any] = Field(
+        default_factory=dict, description="Additional kwargs for the EdenAI API."
     )
-    top_k: Optional[int] = Field(default=None, description="Top-k sampling parameter.")
-    chat_global_action: Optional[str] = Field(
-        default=None, description="Global action for chat models."
+    base_url: str = Field(
+        default="https://api.edenai.run/v2/llm/chat/",
+        description="Base URL for the EdenAI API",
     )
+    request_timeout: float = Field(
+        default=120.0, description="Timeout for API requests in seconds."
+    )
+
+    _sync_client: httpx.Client = PrivateAttr()
+    _async_client: httpx.AsyncClient = PrivateAttr()
 
     def __init__(
         self,
-        model_name: str = "openai/gpt-4o",
+        model: str = "openai/gpt-4o",
         temperature: Optional[float] = 0,
         max_tokens: Optional[int] = 1000,
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        additional_kwargs: Optional[Dict[str, Any]] = None,
         callback_manager: Optional[CallbackManager] = None,
+        request_timeout: Optional[float] = None,
         **kwargs: Any,
     ):
+        resolved_base_url = (
+            base_url if base_url is not None else self.model_fields["base_url"].default
+        )
+        resolved_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else self.model_fields["request_timeout"].default
+        )
+
+        if not api_key:
+            raise ValueError("EdenAI API key must be provided.")
+
         super().__init__(
-            model_name=model_name,
+            model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             api_key=api_key,
+            base_url=resolved_base_url,
             callback_manager=callback_manager,
-            kwargs=kwargs,
+            additional_kwargs=additional_kwargs or {},
+            request_timeout=resolved_timeout,
+            **kwargs,
         )
+        self._sync_client = httpx.Client(timeout=self.request_timeout)
+        self._async_client = httpx.AsyncClient(timeout=self.request_timeout)
+
+    def close(self):
+        """Close the underlying httpx clients."""
+        if hasattr(self, "_sync_client") and not self._sync_client.is_closed:
+            self._sync_client.close()
+        if hasattr(self, "_async_client") and not self._async_client.is_closed:
+            try:
+                pass
+            except Exception as e:
+                print(f"Warning: Error closing async client: {e}")
+
+    def __del__(self):
+        """Attempt to close clients on garbage collection."""
+        self.close()
 
     @classmethod
     def class_name(cls) -> str:
@@ -75,323 +105,411 @@ class EdenaiMultiModal(MultiModalLLM):
     @property
     def metadata(self) -> MultiModalLLMMetadata:
         return MultiModalLLMMetadata(
-            model_name=self.model_name, num_output=self.max_tokens
+            model_name=self.model_name,
+            is_chat_model=True,
+            max_tokens=self.max_tokens,
         )
 
     def _get_default_parameters(self) -> Dict:
-        return {
-            key: value
-            for key, value in {
-                "temperature": self.temperature,
-                "max_tokens": self.max_tokens,
-                "top_p": self.top_p,
-                "top_k": self.top_k,
-                "chat_global_action": self.chat_global_action,
-            }.items()
-            if value is not None
+        params = {
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
         }
+        return {k: v for k, v in params.items() if v is not None}
 
-    def _call_edenai_api(
+    def _prepare_api_payload(
         self,
-        model: str,
         messages: List[Dict],
-        parameters: Optional[Dict] = None,
+        stream: bool = False,
         **kwargs: Any,
     ) -> Dict:
-        """
-        Makes a direct API call to EdenAI's generative chat endpoint.
-
-        Args:
-            model (str): The model name to use for the request.
-            messages (List[Dict]): A list of message dictionaries to send.
-            parameters (Optional[Dict]): Additional parameters for the API call.
-            **kwargs: Any extra parameters to include in the payload.
-
-        Returns:
-            Dict: The JSON response from the API.
-        """
-        api_url = "https://api.edenai.run/v2/multimodal/chat"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
+        """Prepares the JSON payload for the API request."""
+        merged_params = {
+            **self._get_default_parameters(),
+            **self.additional_kwargs,
+            **kwargs,
         }
 
-        payload = {
+        return {
             "messages": messages,
-            "show_original_response": True,
-            "providers": [self.model_name],
+            "model": self.model_name,
+            "stream": stream,
+            **merged_params,
         }
 
-        if parameters:
-            payload.update(parameters)
-
-        payload.update(kwargs)
-
-        try:
-            response = httpx.post(api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            raise ValueError(
-                f"EdenAI API request failed with status code {e.response.status_code}: {e.response.text}"
-            )
-        except Exception as e:
-            raise ValueError(f"An error occurred while calling EdenAI API: {e}")
+    def _prepare_api_headers(self) -> Dict:
+        """Prepares the headers for the API request."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
     def _format_message(
-        self, prompt: str, image_documents: Sequence[ImageNode], role: MessageRole
-    ) -> Dict:
-        """
-        Formats a message for the EdenAI API.
-
-        Args:
-            prompt (str): The text prompt.
-            image_documents (Sequence[ImageNode]): A list of image nodes.
-            role (MessageRole): The role of the message (e.g., user, system).
-
-        Returns:
-            Dict: A formatted message for the API.
-        """
-        content = []
-        if image_documents:
-            for image_document in image_documents:
-                if image_document.image_url:
-                    content.append(
-                        {
-                            "type": "media_url",
-                            "content": {
-                                "media_url": image_document.image_url,
-                                "media_type": "image/jpeg",
-                            },
-                        }
-                    )
-                else:
-                    content.append(
-                        {
-                            "type": "media_base64",
-                            "content": {"media_base64": image_document.image},
-                        }
-                    )
-
-        content.append({"type": "text", "content": {"text": prompt}})
-        return [{"role": role.value, "content": content}]
-
-    def complete(
-        self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any
-    ) -> CompletionResponse:
-        """
-        Sends a completion request to the EdenAI API.
-
-        Args:
-            prompt (str): The text prompt.
-            image_documents (Sequence[ImageNode]): A list of image nodes.
-
-        Returns:
-            CompletionResponse: The API response.
-        """
-        parameters = self._get_default_parameters()
-        parameters.update(kwargs)
-
-        content = self._format_message(prompt, image_documents, MessageRole.USER)
-
-        response = self._call_edenai_api(
-            model=self.model_name, messages=content, parameters=parameters, **kwargs
+        self, prompt: str, image_documents: Sequence[ImageDocument], role: MessageRole
+    ) -> List[Dict]:
+        """Formats a single prompt and images into the API message structure."""
+        single_chat_message = ChatMessage(
+            role=role,
+            content=prompt,
+            additional_kwargs={"image_documents": image_documents or []},
         )
-
-        return edenai_response_to_completion_response(response, self.model_name)
+        return self._process_messages([single_chat_message])
 
     def _process_messages(
         self, messages: Sequence[ChatMessage]
     ) -> List[Dict[str, Any]]:
-        """
-        Processes a list of `ChatMessage` instances into the format required by EdenAI API.
-
-        Args:
-            messages (Sequence[ChatMessage]): List of ChatMessage instances with roles and content blocks.
-
-        Returns:
-            List[Dict[str, Any]]: Formatted list of messages for the EdenAI API.
-        """
+        """Processes LlamaIndex ChatMessages into the API list format."""
         formatted_messages = []
+        for msg in messages:
+            role_str = msg.role.value
+            content_list = []
 
-        for message in messages:
-            formatted_message = {"role": message.role.value, "content": []}
+            if msg.content:
+                content_list.append({"type": "text", "text": msg.content})
 
-            for block in message.blocks:
-                if isinstance(block, TextBlock):
-                    formatted_message["content"].append(
-                        {"type": "text", "content": {"text": block.text}}
-                    )
-                elif isinstance(block, ImageBlock):
-                    if block.image:
-                        formatted_message["content"].append(
-                            {
-                                "type": "media_base64",
-                                "content": {
-                                    "media_base64": str(block.image),
-                                    "media_type": block.image_mimetype or "image/jpeg",
-                                },
-                            }
-                        )
-                    elif block.path:
-                        try:
-                            with open(block.path, "rb") as f:
-                                image_data = f.read()
-                            formatted_message["content"].append(
+            image_docs_in_kwargs = msg.additional_kwargs.get("image_documents", [])
+            if isinstance(image_docs_in_kwargs, Sequence):
+                for image_doc in image_docs_in_kwargs:
+                    if isinstance(image_doc, ImageDocument):
+                        img_url = None
+                        if image_doc.image_url:
+                            img_url = image_doc.image_url
+                        elif image_doc.image_path:
+                            try:
+                                with open(image_doc.image_path, "rb") as f:
+                                    img_data = base64.b64encode(f.read()).decode(
+                                        "utf-8"
+                                    )
+                                    mimetype = "image/jpeg"
+                                    if image_doc.image_path.lower().endswith(".png"):
+                                        mimetype = "image/png"
+                                    elif image_doc.image_path.lower().endswith(".gif"):
+                                        mimetype = "image/gif"
+                                    elif image_doc.image_path.lower().endswith(".webp"):
+                                        mimetype = "image/webp"
+                                    img_url = f"data:{mimetype};base64,{img_data}"
+                            except Exception as e:
+                                print(
+                                    f"Warning: Failed to read image file {image_doc.image_path}: {e}"
+                                )
+                        elif (
+                            image_doc.image
+                            and isinstance(image_doc.image, str)
+                            and image_doc.image.startswith("data:")
+                        ):
+                            img_url = image_doc.image
+
+                        if img_url:
+                            content_list.append(
                                 {
-                                    "type": "media_base64",
-                                    "content": {
-                                        "media_base64": str(image_data),
-                                        "media_type": block.image_mimetype
-                                        or "image/jpeg",
-                                    },
+                                    "type": "image_url",
+                                    "image_url": {"url": img_url, "detail": "auto"},
                                 }
                             )
-                        except FileNotFoundError as e:
-                            raise ValueError(
-                                f"Image file not found at path: {block.path}"
-                            ) from e
-                    elif block.url:
-                        formatted_message["content"].append(
-                            {
-                                "type": "media_url",
-                                "content": {
-                                    "media_url": str(block.url),
-                                    "media_type": block.image_mimetype or "image/jpeg",
-                                },
-                            }
-                        )
+                        else:
+                            print(
+                                f"Warning: Could not resolve image data in ImageDocument for role {role_str}"
+                            )
                     else:
-                        raise ValueError(
-                            "ImageBlock must have either 'image', 'path', or 'url' defined."
+                        print(
+                            f"Warning: Item in image_documents is not an ImageDocument: {type(image_doc)}"
                         )
 
-            formatted_messages.append(formatted_message)
+            if content_list:
+                formatted_messages.append({"role": role_str, "content": content_list})
+            else:
+                if role_str == MessageRole.USER.value:
+                    print(
+                        f"Warning: Skipping user message with no text or processable images."
+                    )
+                    formatted_messages.append({"role": role_str, "content": ""})
 
         return formatted_messages
 
-    def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
-        parameters = self._get_default_parameters()
-        parameters.update(kwargs)
+    def _get_response_token_counts(self, raw_response_json: Any) -> dict:
+        """Extracts token usage from the raw JSON response."""
+        if isinstance(raw_response_json, dict):
+            usage = raw_response_json.get("usage", {})
+            if isinstance(usage, dict):
+                return {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+        return {}
 
-        formatted_messages = self._process_messages(messages)
+    def complete(
+        self,
+        prompt: str,
+        image_documents: Optional[Sequence[ImageDocument]] = None,
+        **kwargs: Any,
+    ) -> CompletionResponse:
+        """Sends a completion request (non-streaming)."""
+        formatted_messages = self._format_message(
+            prompt, image_documents or [], MessageRole.USER
+        )
+        if not formatted_messages:
+            raise ValueError("Could not format message for completion.")
 
-        response = self._call_edenai_api(
-            model=self.model_name,
-            messages=formatted_messages,
-            parameters=parameters,
+        payload = self._prepare_api_payload(formatted_messages, stream=False, **kwargs)
+        headers = self._prepare_api_headers()
+
+        try:
+            response = self._sync_client.post(
+                self.base_url, headers=headers, json=payload
+            )
+            response.raise_for_status()
+            raw_response_json = response.json()
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text
+            try:
+                error_detail = e.response.json().get("detail", error_detail)
+            except Exception:
+                pass
+            raise ValueError(
+                f"EdenAI API request failed status {e.response.status_code}: {error_detail}"
+            ) from e
+        except Exception as e:
+            raise ValueError(f"An error occurred calling EdenAI API: {e}") from e
+
+        text_response = ""
+        if (
+            isinstance(raw_response_json.get("choices"), list)
+            and len(raw_response_json["choices"]) > 0
+        ):
+            message = raw_response_json["choices"][0].get("message", {})
+            if isinstance(message, dict):
+                text_response = message.get("content", "") or ""
+
+        return CompletionResponse(
+            text=text_response,
+            raw=raw_response_json,
+            additional_kwargs=self._get_response_token_counts(raw_response_json),
         )
 
-        return edenai_response_to_chat_response(response, self.model_name)
+    def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
+        """Sends a chat request (non-streaming)."""
+        formatted_messages = self._process_messages(messages)
+        if not formatted_messages:
+            raise ValueError("No valid messages could be formatted for the API call.")
+
+        payload = self._prepare_api_payload(formatted_messages, stream=False, **kwargs)
+        headers = self._prepare_api_headers()
+
+        try:
+            response = self._sync_client.post(
+                self.base_url, headers=headers, json=payload
+            )
+            response.raise_for_status()
+            raw_response_json = response.json()
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text
+            try:
+                error_detail = e.response.json().get("detail", error_detail)
+            except Exception:
+                pass
+            raise ValueError(
+                f"EdenAI API chat request failed status {e.response.status_code}: {error_detail}"
+            ) from e
+        except Exception as e:
+            raise ValueError(f"An error occurred calling EdenAI chat API: {e}") from e
+
+        ai_content = None
+        role = MessageRole.ASSISTANT
+        if (
+            isinstance(raw_response_json.get("choices"), list)
+            and len(raw_response_json["choices"]) > 0
+        ):
+            message_data = raw_response_json["choices"][0].get("message", {})
+            if isinstance(message_data, dict):
+                ai_content = message_data.get("content")
+                role_str = message_data.get("role", "assistant")
+                try:
+                    role = MessageRole(role_str)
+                except ValueError:
+                    print(
+                        f"Warning: Unknown role '{role_str}' received from API, using ASSISTANT."
+                    )
+                    role = MessageRole.ASSISTANT
+
+        response_message = ChatMessage(role=role, content=ai_content)
+
+        return ChatResponse(
+            message=response_message,
+            raw=raw_response_json,
+            additional_kwargs=self._get_response_token_counts(raw_response_json),
+        )
+
+    def stream_complete(
+        self,
+        prompt: str,
+        image_documents: Optional[Sequence[ImageDocument]] = None,
+        **kwargs: Any,
+    ) -> CompletionResponseGen:
+        formatted_messages = self._format_message(
+            prompt, image_documents or [], MessageRole.USER
+        )
+        payload = self._prepare_api_payload(formatted_messages, stream=True, **kwargs)
+        headers = self._prepare_api_headers()
+
+        try:
+            with self._sync_client.stream(
+                "POST", self.base_url, headers=headers, json=payload
+            ) as response:
+                full_text = ""
+                for line in response.iter_lines():
+                    delta, raw_chunk = parse_edenai_stream_chunk(line)
+                    if delta is None:
+                        continue
+                    full_text += delta
+                    yield CompletionResponse(text=full_text, delta=delta, raw=raw_chunk)
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.read().decode()
+            raise ValueError(f"Stream error: {error_detail}") from e
+
+    def stream_chat(
+        self, messages: Sequence[ChatMessage], **kwargs: Any
+    ) -> ChatResponseGen:
+        """Sends a chat request (streaming)."""
+        formatted_messages = self._process_messages(messages)
+        if not formatted_messages:
+            raise ValueError("No valid messages could be formatted for the API call.")
+
+        payload = self._prepare_api_payload(formatted_messages, stream=True, **kwargs)
+        headers = self._prepare_api_headers()
+
+        try:
+            with self._sync_client.stream(
+                "POST", self.base_url, headers=headers, json=payload
+            ) as response:
+                full_content = ""
+                for line in response.iter_lines():
+                    delta, raw_chunk = parse_edenai_stream_chunk(line)
+
+                    if delta is None:
+                        continue
+
+                    full_content += delta
+                    response_message = ChatMessage(
+                        role=MessageRole.ASSISTANT, content=full_content
+                    )
+                    yield ChatResponse(
+                        message=response_message, delta=delta, raw=raw_chunk
+                    )
+
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.read().decode()
+            raise ValueError(f"Stream error: {error_detail}") from e
 
     async def acomplete(
-        self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any
+        self,
+        prompt: str,
+        image_documents: Optional[Sequence[ImageDocument]] = None,
+        **kwargs: Any,
     ) -> CompletionResponse:
-        """
-        Asynchronously sends a completion request to the EdenAI API.
+        """Asynchronously sends a completion request (non-streaming)."""
+        formatted_messages = self._format_message(
+            prompt, image_documents or [], MessageRole.USER
+        )
+        if not formatted_messages:
+            raise ValueError("Could not format message for completion.")
 
-        Args:
-            prompt (str): The text prompt.
-            image_documents (Sequence[ImageNode]): A list of image nodes.
+        payload = self._prepare_api_payload(formatted_messages, stream=False, **kwargs)
+        headers = self._prepare_api_headers()
 
-        Returns:
-            CompletionResponse: The API response.
-        """
-        parameters = self._get_default_parameters()
-        parameters.update(kwargs)
-
-        content = self._format_message(prompt, image_documents, MessageRole.USER)
-
-        api_url = "https://api.edenai.run/v2/multimodal/chat"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-        }
-
-        payload = {
-            "messages": content,
-            "show_original_response": True,
-            "providers": [self.model_name],
-        }
-
-        if parameters:
-            payload.update(parameters)
-
-        payload.update(kwargs)
-
-        async with httpx.AsyncClient() as client:
+        try:
+            response = await self._async_client.post(
+                self.base_url, headers=headers, json=payload
+            )
+            response.raise_for_status()
+            raw_response_json = response.json()
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text
             try:
-                response = await client.post(api_url, headers=headers, json=payload)
-                response.raise_for_status()
-                return edenai_response_to_completion_response(
-                    response.json(), self.model_name
-                )
-            except httpx.HTTPStatusError as e:
-                raise ValueError(
-                    f"EdenAI API request failed with status code {e.response.status_code}: {e.response.text}"
-                )
-            except Exception as e:
-                raise ValueError(f"An error occurred while calling EdenAI API: {e}")
+                error_detail = e.response.json().get("detail", error_detail)
+            except Exception:
+                pass
+            raise ValueError(
+                f"EdenAI async API request failed status {e.response.status_code}: {error_detail}"
+            ) from e
+        except httpx.ClientClosed:
+            raise RuntimeError("HTTPX async client was closed.") from None
+        except Exception as e:
+            raise ValueError(f"An error occurred calling EdenAI async API: {e}") from e
+
+        text_response = ""
+        if (
+            isinstance(raw_response_json.get("choices"), list)
+            and len(raw_response_json["choices"]) > 0
+        ):
+            message = raw_response_json["choices"][0].get("message", {})
+            if isinstance(message, dict):
+                text_response = message.get("content", "") or ""
+
+        return CompletionResponse(
+            text=text_response,
+            raw=raw_response_json,
+            additional_kwargs=self._get_response_token_counts(raw_response_json),
+        )
 
     async def achat(
         self, messages: Sequence[ChatMessage], **kwargs: Any
     ) -> ChatResponse:
-        """
-        Asynchronously sends a chat request to the EdenAI API.
-
-        Args:
-            messages (Sequence[ChatMessage]): List of ChatMessage instances with roles and content blocks.
-
-        Returns:
-            ChatResponse: The API response.
-        """
-        parameters = self._get_default_parameters()
-        parameters.update(kwargs)
-
+        """Asynchronously sends a chat request (non-streaming)."""
         formatted_messages = self._process_messages(messages)
+        if not formatted_messages:
+            raise ValueError("No valid messages could be formatted for the API call.")
 
-        async with httpx.AsyncClient() as client:
+        payload = self._prepare_api_payload(formatted_messages, stream=False, **kwargs)
+        headers = self._prepare_api_headers()
+
+        try:
+            response = await self._async_client.post(
+                self.base_url, headers=headers, json=payload
+            )
+            response.raise_for_status()
+            raw_response_json = response.json()
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text
             try:
-                response = await client.post(
-                    "https://api.edenai.run/v2/multimodal/chat",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={
-                        "messages": formatted_messages,
-                        "show_original_response": True,
-                        "providers": [self.model_name],
-                        **parameters,
-                        **kwargs,
-                    },
-                )
-                response.raise_for_status()
-                return edenai_response_to_chat_response(
-                    response.json(), self.model_name
-                )
-            except httpx.HTTPStatusError as e:
-                raise ValueError(
-                    f"EdenAI API request failed with status code {e.response.status_code}: {e.response.text}"
-                )
-            except Exception as e:
-                raise ValueError(f"An error occurred while calling EdenAI API: {e}")
+                error_detail = e.response.json().get("detail", error_detail)
+            except Exception:
+                pass
+            raise ValueError(
+                f"EdenAI async chat request failed status {e.response.status_code}: {error_detail}"
+            ) from e
+        except httpx.ClientClosed:
+            raise RuntimeError("HTTPX async client was closed.") from None
+        except Exception as e:
+            raise ValueError(
+                f"An error occurred calling EdenAI async chat API: {e}"
+            ) from e
 
-    def stream_chat(self, messages: Sequence[Any], **kwargs: Any) -> Any:
-        """Stream chat with the model."""
-        raise NotImplementedError("Stream chat is not supported for this model.")
+        ai_content = None
+        role = MessageRole.ASSISTANT
+        if (
+            isinstance(raw_response_json.get("choices"), list)
+            and len(raw_response_json["choices"]) > 0
+        ):
+            message_data = raw_response_json["choices"][0].get("message", {})
+            if isinstance(message_data, dict):
+                ai_content = message_data.get("content")
+                role_str = message_data.get("role", "assistant")
+                try:
+                    role = MessageRole(role_str)
+                except ValueError:
+                    role = MessageRole.ASSISTANT
 
-    async def astream_chat(self, messages: Sequence[Any], **kwargs: Any) -> Any:
-        """Stream chat with the model asynchronously."""
-        raise NotImplementedError("Async stream chat is not supported for this model.")
+        response_message = ChatMessage(role=role, content=ai_content)
 
-    def stream_complete(
-        self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any
-    ) -> Any:
-        """Complete the prompt with image support in a streaming fashion."""
-        raise NotImplementedError(
-            "Streaming completion is not supported for this model."
+        return ChatResponse(
+            message=response_message,
+            raw=raw_response_json,
+            additional_kwargs=self._get_response_token_counts(raw_response_json),
         )
 
-    async def astream_complete(
-        self, prompt: str, image_documents: Sequence[ImageNode], **kwargs: Any
-    ) -> Any:
-        """Complete the prompt with image support in a streaming fashion asynchronously."""
-        raise NotImplementedError(
-            "Async streaming completion is not supported for this model."
-        )
+    async def astream_complete(self, **kwargs: Any) -> Any:
+        raise NotImplementedError("This function is not yet implemented.")
+
+    async def astream_chat(self, **kwargs: Any) -> Any:
+        raise NotImplementedError("This function is not yet implemented.")
